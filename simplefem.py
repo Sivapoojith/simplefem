@@ -9,6 +9,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 unused import
 import pandas as pd
 import tetgen
 from mayavi import mlab
+from tqdm import tqdm
 
 
 class VertexManager:
@@ -122,12 +123,12 @@ def solve_full(elements, verts, poisson, youngs, constraints, loads):
     D = generate_elasticity_mat(youngs, poisson)
     load_arr = get_loads(loads, verts)
     K_g = []
-    for el in elements:
+    for el in tqdm(elements):
         add_local_stiffness(D, K_g, verts, el)
     data = [k[2] for k in K_g]
     rows = [k[0] for k in K_g]
     cols = [k[1] for k in K_g]
-    K_g_sp = coo_matrix((data, (rows, cols))).tolil()
+    K_g_sp = coo_matrix((data, (rows, cols))).tocsc()
     apply_constraints(K_g_sp, constraints)
     displacements = solve_fem(K_g_sp, load_arr)
     return displacements
@@ -162,7 +163,7 @@ def generate_unstructured_grid(elem, node):
     return grid
 
 
-def display_tets(verts, elements, magnitudes=None):
+def add_tets_to_display(verts, elements, plotter, magnitudes=None):
     triangles = []
     for el in elements:
         e = el.tolist()
@@ -173,24 +174,63 @@ def display_tets(verts, elements, magnitudes=None):
     triangles = np.array(triangles)
     
     grid = generate_unstructured_grid(elements, verts)
-    grid.plot(scalars=magnitudes, stitle='Quality', cmap='bwr',
-             flip_scalars=True, show_edges=True,)
+    plotter.add_mesh(grid, scalars=magnitudes, stitle='Quality', cmap='bwr',
+                    flip_scalars=True, show_edges=True,)
 
-def indices_to_vector(i, j, k, shape):
+def display_tets(verts, elements, magnitudes=None):
+    plotter = pv.Plotter()
+    add_tets_to_display(verts, elements, plotter, magnitudes)
+    plotter.show()
+
+def indices_to_vector(indices, shape):
+    i, j, k = indices
     val = i*shape[2]*shape[1] + j*shape[2] + k
-    print(val, i, j, k, shape)
     return val
 
-def grid_to_tets(grid):
+def grid_to_tets(grid, scale=1.0):
     manager = VertexManager(grid.shape)
     tets = []
-    for i in range(grid.shape[0]):
-        for j in range(grid.shape[1]):
-            for k in range(grid.shape[2]):
+    for i in range(grid.shape[0]-1):
+        for j in range(grid.shape[1]-1):
+            for k in range(grid.shape[2]-1):
                 if np.all(grid[i:i+2, j:j+2, k:k+2] > 0):
                     new_tets = get_offset_tet(np.array([i, j, k]), manager)
                     tets += new_tets
-    return np.array(tets, dtype=np.int), np.array(manager.vertices)
+    return np.array(tets, dtype=np.int), np.array(manager.vertices)*scale, manager
+
+
+def scale_indices(indices, shape, scale):
+    scaled = []
+    for i in range(len(indices)):
+        scaled.append(indices[i] / shape[i] * (scale[i][1] - scale[i][0]) + scale[i][0])
+    return scaled
+
+
+def mesh_to_grid(mesh, pitch):
+    # gridscale: ((min, max), (min, max), (min, max)) where each point i becomes i/i_size*(max-min) + min
+
+    #scale mesh properly to match grid
+    #iterate through all points in grid centers!
+    #   if point is inside the mesh, set grid corners to 1, 0 otherwise
+    true_faces = []
+    print(mesh.faces)
+    for i in range(1, len(mesh.faces), 4):
+        true_faces.append([mesh.faces[i], mesh.faces[i+1], mesh.faces[i+2]])
+
+    tri_version = trimesh.Trimesh(mesh.points, true_faces)
+    # TODO, pick the smallest cell size
+    voxels = tri_version.voxelized(pitch)
+    voxels.fill()
+    mat = voxels.encoding.dense
+
+    return np.array(mat, dtype=np.int)
+
+def sweep_plane(grid, plane, direction):
+    # start the plane in the grid
+    # step it one grid length at a time
+    # if there is a point there, add that node to the list
+    # return all the nodes
+    pass
 
 
 def get_offset_tet(base_idx, manager):
@@ -223,11 +263,52 @@ def get_offset_tet(base_idx, manager):
         tets.append(single_tet)
     return tets
 
+def mesh_select(verts, mesh):
+    # takes a pv mesh
+    verts = pv.PolyData(verts)
+    distances = verts.select_enclosed_points(mesh)
+    return np.array(distances.points)
+
+def test_mesh_conversion():
+    #mesh = pv.Sphere()
+    mesh = pv.Box((-1.0, 1.0, -5.0, 5.0, -1.0, 1.0))
+    mesh = mesh.triangulate()
+    bounds = mesh.bounds
+    scale = list(zip(bounds[::2], bounds[1::2]))
+    print("scale: ", scale)
+    grid = mesh_to_grid(mesh, 0.1)
+
+    tets, verts, manager = grid_to_tets(grid)
+
+    display_tets(verts, tets)
+
+    constraints = [[0, [1, 1, 1]],
+                   [10, [1, 1, 1]],
+                   [20, [1, 1, 1]],
+                   [30, [1, 1, 1]]]
+
+    loads = [[44000, 10000., 0.0, 0],
+             [43000, 1000., 0.0, 0],
+             [43345, 1000., 0.0, 0],
+             [44517, 10000., 0.0, 0]]
+    poisson = 0.3
+    youngs = 2000
+
+    displacements = solve_full(tets, verts, poisson, youngs, constraints, loads)
+    magnitudes = get_displacement_magnitudes(displacements)
+    print("tets: ", tets)
+
 
 def test_box_grid():
-    grid = np.zeros((8, 8, 8))
-    grid[3:6, 2:6, 3:6] = 1
-    elements, vertices = grid_to_tets(grid)
+    grid = np.zeros((30, 30, 30))
+    grid[13:18, 5:25, 13:18] = 1
+
+    elements, vertices, vert_manager = grid_to_tets(grid, 0.1)
+
+    mesh = examples.download_cow()
+    distances = mesh_select(vertices, mesh)
+    print("distances: ", distances)
+
     print(elements, vertices)
     constraints = [[0, [1, 1, 1]],
                    [1, [1, 1, 1]],
@@ -244,7 +325,14 @@ def test_box_grid():
     displacements = solve_full(elements, vertices, poisson, youngs, constraints, loads)
     magnitudes = get_displacement_magnitudes(displacements)
     print("magnitudes", magnitudes)
-    display_tets(vertices, elements, magnitudes)
+
+    plotter = pv.Plotter()
+    #add_tets_to_display(vertices, elements, plotter, magnitudes)
+
+    surface = generate_unstructured_grid(elements, vertices)
+    voxels = pv.voxelize(surface, density=surface.length/200)
+    plotter.add_mesh(voxels)
+    plotter.show()
 
 def test_pv_box():
     box = pv.Box((-1.0, 1.0, -5.0, 5.0, -1.0, 1.0))
@@ -277,8 +365,14 @@ def test_pv_box():
 
     display_tets(verts, cell_arr, magnitudes)
 
+def test_voxel_fem():
+    surface = examples.download_foot_bones()
+    voxels = pv.voxelize(surface, density=surface.length/200)
+    import ipdb; ipdb.set_trace()
+
+
 def main():
-    test_box_grid()
+    test_mesh_conversion()
 
 if __name__ == "__main__":
     main()
