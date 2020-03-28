@@ -37,9 +37,9 @@ def generate_elasticity_mat(youngs, poissons):
     mat = np.array([[1 - v, v, v, 0, 0, 0],
                     [v, 1 - v, v, 0, 0, 0],
                     [v, v, 1 - v, 0, 0, 0],
-                    [0, 0, 0, 1 - 2*v, 0, 0],
-                    [0, 0, 0, 0, 1 - 2*v, 0],
-                    [0, 0, 0, 0, 0, 1 - 2*v],
+                    [0, 0, 0, (1 - 2*v)/2., 0, 0],
+                    [0, 0, 0, 0, (1 - 2*v)/2., 0],
+                    [0, 0, 0, 0, 0, (1 - 2*v)/2.],
                    ])
     elasticity_mat = E / ((1 + v) * (1 - 2 * v)) * mat
     return elasticity_mat
@@ -53,7 +53,7 @@ def add_local_stiffness(D, K_g, nodes, el_nodes):
     ones = np.array([1.0, 1.0, 1.0, 1.0])
     
     C = np.vstack((ones.T, x.T, y.T, z.T))
-    IC = np.linalg.inv(C)
+    IC = np.linalg.inv(C) * 6 * np.linalg.det(C)
     B = np.zeros((6, 12))
     
     for i in range(4):
@@ -69,10 +69,10 @@ def add_local_stiffness(D, K_g, nodes, el_nodes):
         
         B[5, i*3] = IC[3, i]
         B[5, i*3 + 2] = IC[1, i]
-        
+
     B = B / (np.linalg.det(C))
     
-    tet_volume = 1 / 6. * np.abs(np.linalg.det(C))
+    tet_volume = 1 / 6. * np.linalg.det(C)
     K_loc_unscaled = np.dot(np.dot(B.T, D.T), B)
     K_l = K_loc_unscaled * tet_volume
 
@@ -94,6 +94,8 @@ def add_local_stiffness(D, K_g, nodes, el_nodes):
 
 def apply_constraints(K_g_sp, constraints):
     # constraint is of type [(node, [x, y, z]), ...] where xyz are 1 for constraint, 0 for no constraint
+
+    # TODO, the constraint setting seems to be wrong!  Make sure it's on the same row for similar node constraints
     for constraint in constraints:
         for i in range(len(constraint[1])):
             if constraint[1][i] == 1:
@@ -104,6 +106,7 @@ def apply_constraints(K_g_sp, constraints):
             if constraint[1][i] == 1:
                 idx = constraint[0]*3 + i
                 K_g_sp[idx, idx] = 1.0
+    print(K_g_sp.todense())
                 
 def get_loads(loads, verts):
     # loads is of tpye [(node, x, y, z)]
@@ -123,15 +126,16 @@ def solve_full(elements, verts, poisson, youngs, constraints, loads):
     D = generate_elasticity_mat(youngs, poisson)
     load_arr = get_loads(loads, verts)
     K_g = []
+    B_mats = []
     for el in tqdm(elements):
-        add_local_stiffness(D, K_g, verts, el)
+        B_mats.append(add_local_stiffness(D, K_g, verts, el))
     data = [k[2] for k in K_g]
     rows = [k[0] for k in K_g]
     cols = [k[1] for k in K_g]
     K_g_sp = coo_matrix((data, (rows, cols))).tocsc()
     apply_constraints(K_g_sp, constraints)
     displacements = solve_fem(K_g_sp, load_arr)
-    return displacements
+    return displacements, B_mats
 
 def extract_tets(cells):
     cell_arr = []
@@ -144,6 +148,23 @@ def get_displacement_magnitudes(displacements):
     num_verts = len(displacements) // 3
     mags = np.linalg.norm(displacements.reshape((num_verts, 3)), axis=1)
     return mags
+
+def get_strains(elements, displacements, B_mats, D):
+    # TODO This is get stresses!!!!
+    # https://www.continuummechanics.org/vonmisesstress.html
+    # TODO we're doubling up on stress calcs here because we color vertices not faces.
+    # we can maybe come up with a more efficient method
+    sigmas = np.zeros(displacements.shape[0] // 3)
+    for el, B in zip(elements, B_mats):
+        delta = np.array([3*el[0], 3*el[0] + 1, 3*el[0] + 2,
+                          3*el[1], 3*el[1] + 1, 3*el[1] + 2,
+                          3*el[2], 3*el[2] + 1, 3*el[2] + 2,
+                          3*el[3], 3*el[3] + 1, 3*el[3] + 2])
+        sigma = np.linalg.multi_dot((D, B, delta))
+        for node in el:
+            # TODO clean this up
+            sigmas[node] = np.sqrt(sigma[0]**2 + sigma[1]**2 + sigma[2]**2 - sigma[0]*sigma[1] - sigma[1]*sigma[2] - sigma[2]*sigma[0] + 3*(sigma[3]**2 + sigma[4]**2 + sigma[5]**2))
+    return sigmas
 
 def generate_unstructured_grid(elem, node):
     buf = np.empty((elem.shape[0], 1), np.int64)
@@ -174,7 +195,7 @@ def add_tets_to_display(verts, elements, plotter, magnitudes=None):
     triangles = np.array(triangles)
     
     grid = generate_unstructured_grid(elements, verts)
-    plotter.add_mesh(grid, scalars=magnitudes, stitle='Quality', cmap='bwr',
+    plotter.add_mesh(grid, scalars=magnitudes, stitle='Quality', cmap='GnBu_r',
                     flip_scalars=True, show_edges=True,)
 
 def display_tets(verts, elements, magnitudes=None):
@@ -276,28 +297,52 @@ def test_mesh_conversion():
     bounds = mesh.bounds
     scale = list(zip(bounds[::2], bounds[1::2]))
     print("scale: ", scale)
-    grid = mesh_to_grid(mesh, 0.1)
+    grid = mesh_to_grid(mesh, 0.5)
 
     tets, verts, manager = grid_to_tets(grid)
+    print(tets)
 
     display_tets(verts, tets)
 
     constraints = [[0, [1, 1, 1]],
                    [10, [1, 1, 1]],
                    [20, [1, 1, 1]],
-                   [30, [1, 1, 1]]]
+                   [30, [1, 1, 1]],
+                   [40, [1, 1, 1]],
+                   [15, [1, 1, 1]],
+                   [26, [1, 1, 1]],
+                   [32, [1, 1, 1]],
+                   [5, [1, 1, 1]],
+                   [15, [1, 1, 1]],
+                   [12, [1, 1, 1]],
+                   [3, [1, 1, 1]]]
 
-    loads = [[44000, 10000., 0.0, 0],
-             [43000, 1000., 0.0, 0],
-             [43345, 1000., 0.0, 0],
-             [44517, 10000., 0.0, 0]]
-    poisson = 0.3
-    youngs = 2000
 
-    displacements = solve_full(tets, verts, poisson, youngs, constraints, loads)
-    magnitudes = get_displacement_magnitudes(displacements)
-    print("tets: ", tets)
+    loads = [[520, 10., 0.0, 0],
+             [516, 10., 0.0, 0],
+             [512, 10., 0.0, 0],
+             [508, 10., 0.0, 0],
+             [504, 10., 0.0, 0],
+             [500, 10., 0.0, 0],
+             [496, 10., 0.0, 0],
+             [492, 10., 0.0, 0],
+             [484, 10., 0.0, 0],
+             [480, 10., 0.0, 0],
+             [518, 10., 0.0, 0],
+             [510, 10., 0.0, 0]]
 
+    poisson = 0.35
+    youngs = 3.5
+
+    displacements, B_mats = solve_full(tets, verts, poisson, youngs, constraints, loads)
+    #magnitudes = get_displacement_magnitudes(displacements)
+    D = generate_elasticity_mat(youngs, poisson)
+    print("generating strains")
+    sigmas = get_strains(tets, displacements, B_mats, D)
+    display_tets(verts, tets, sigmas)
+
+def fem_test():
+    pass
 
 def test_box_grid():
     grid = np.zeros((30, 30, 30))
