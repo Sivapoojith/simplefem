@@ -106,7 +106,6 @@ def apply_constraints(K_g_sp, constraints):
             if constraint[1][i] == 1:
                 idx = constraint[0]*3 + i
                 K_g_sp[idx, idx] = 1.0
-    print(K_g_sp.todense())
                 
 def get_loads(loads, verts):
     # loads is of tpye [(node, x, y, z)]
@@ -149,7 +148,7 @@ def get_displacement_magnitudes(displacements):
     mags = np.linalg.norm(displacements.reshape((num_verts, 3)), axis=1)
     return mags
 
-def get_strains(elements, displacements, B_mats, D):
+def get_stresses(elements, displacements, B_mats, D):
     # TODO This is get stresses!!!!
     # https://www.continuummechanics.org/vonmisesstress.html
     # TODO we're doubling up on stress calcs here because we color vertices not faces.
@@ -234,7 +233,6 @@ def mesh_to_grid(mesh, pitch):
     #iterate through all points in grid centers!
     #   if point is inside the mesh, set grid corners to 1, 0 otherwise
     true_faces = []
-    print(mesh.faces)
     for i in range(1, len(mesh.faces), 4):
         true_faces.append([mesh.faces[i], mesh.faces[i+1], mesh.faces[i+2]])
 
@@ -245,6 +243,27 @@ def mesh_to_grid(mesh, pitch):
     mat = voxels.encoding.dense
 
     return np.array(mat, dtype=np.int)
+
+def pv_to_trimesh(mesh):
+    true_faces = []
+    for i in range(1, len(mesh.faces), 4):
+        true_faces.append([mesh.faces[i], mesh.faces[i+1], mesh.faces[i+2]])
+    tri_version = trimesh.Trimesh(mesh.points, true_faces)
+    return tri_version
+
+def trimesh_to_pv(mesh):
+    return pv.PolyData(mesh.vertices, mesh.faces)
+
+def voxel_convert(mesh, pitch):
+    # Expects a PV or trimesh object, returns trimesh voxels
+    if type(mesh) != trimesh.Trimesh:
+        tri_version = pv_to_trimesh(mesh)
+    else:
+        tri_version = mesh
+    # TODO, pick the smallest cell size
+    voxels = tri_version.voxelized(pitch)
+    voxels.fill()
+    return voxels
 
 def sweep_plane(grid, plane, direction):
     # start the plane in the grid
@@ -284,6 +303,11 @@ def get_offset_tet(base_idx, manager):
         tets.append(single_tet)
     return tets
 
+def tetrahedralize(mesh, pitch):
+    grid = mesh_to_grid(mesh, pitch)
+    tets, verts, manager = grid_to_tets(grid)
+    return tets, verts, manager
+
 def mesh_select(verts, mesh):
     # takes a pv mesh
     verts = pv.PolyData(verts)
@@ -296,13 +320,12 @@ def test_mesh_conversion():
     mesh = mesh.triangulate()
     bounds = mesh.bounds
     scale = list(zip(bounds[::2], bounds[1::2]))
-    print("scale: ", scale)
     grid = mesh_to_grid(mesh, 0.5)
 
     tets, verts, manager = grid_to_tets(grid)
     print(tets)
 
-    display_tets(verts, tets)
+    #display_tets(verts, tets)
 
     constraints = [[0, [1, 1, 1]],
                    [10, [1, 1, 1]],
@@ -338,8 +361,8 @@ def test_mesh_conversion():
     #magnitudes = get_displacement_magnitudes(displacements)
     D = generate_elasticity_mat(youngs, poisson)
     print("generating strains")
-    sigmas = get_strains(tets, displacements, B_mats, D)
-    display_tets(verts, tets, sigmas)
+    sigmas = get_stresses(tets, displacements, B_mats, D)
+    #display_tets(verts, tets, sigmas)
 
 def fem_test():
     pass
